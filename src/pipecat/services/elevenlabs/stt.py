@@ -11,9 +11,11 @@ using segmented audio processing. The service uploads audio files and receives
 transcription results directly.
 """
 
+import asyncio
 import base64
 import io
 import json
+import time
 from enum import Enum
 from typing import AsyncGenerator, Optional
 
@@ -461,6 +463,8 @@ class ElevenLabsRealtimeSTTService(WebsocketSTTService):
         self._params = params
         self._audio_format = ""  # initialized in start()
         self._receive_task = None
+        self._keepalive_task = None
+        self._last_audio_time: float = 0
 
         self._settings = {"language": params.language_code}
 
@@ -595,6 +599,7 @@ class ElevenLabsRealtimeSTTService(WebsocketSTTService):
                     "sample_rate": self.sample_rate,
                 }
                 await self._websocket.send(json.dumps(message))
+                self._last_audio_time = time.monotonic()
             except Exception as e:
                 yield ErrorFrame(f"ElevenLabs Realtime STT error: {str(e)}")
 
@@ -606,8 +611,13 @@ class ElevenLabsRealtimeSTTService(WebsocketSTTService):
 
         await self._connect_websocket()
 
+        self._last_audio_time = time.monotonic()
+
         if self._websocket and not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
+
+        if self._websocket and not self._keepalive_task:
+            self._keepalive_task = self.create_task(self._keepalive_task_handler())
 
     async def _disconnect(self):
         """Close WebSocket connection and cleanup tasks."""
@@ -617,7 +627,47 @@ class ElevenLabsRealtimeSTTService(WebsocketSTTService):
             await self.cancel_task(self._receive_task)
             self._receive_task = None
 
+        if self._keepalive_task:
+            await self.cancel_task(self._keepalive_task)
+            self._keepalive_task = None
+
         await self._disconnect_websocket()
+
+    async def _keepalive_task_handler(self):
+        """Send periodic silent audio to prevent the server from closing the connection.
+
+        ElevenLabs closes idle WebSocket connections after a timeout. This task
+        sends a small silent audio chunk when no real audio has been sent recently,
+        keeping the connection alive (e.g. when behind a ServiceSwitcher).
+        """
+        KEEPALIVE_INTERVAL = 5  # seconds between keepalive checks
+        KEEPALIVE_TIMEOUT = 10  # send silence if no audio for this many seconds
+        # 100ms of silent 16-bit mono PCM at the current sample rate
+        SILENCE_DURATION = 0.1
+
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            try:
+                if not self._websocket or self._websocket.state is not State.OPEN:
+                    continue
+                elapsed = time.monotonic() - self._last_audio_time
+                if elapsed < KEEPALIVE_TIMEOUT:
+                    continue
+                num_samples = int(self.sample_rate * SILENCE_DURATION)
+                silence = b"\x00" * (num_samples * 2)  # 2 bytes per 16-bit sample
+                audio_base64 = base64.b64encode(silence).decode("utf-8")
+                message = {
+                    "message_type": "input_audio_chunk",
+                    "audio_base_64": audio_base64,
+                    "commit": False,
+                    "sample_rate": self.sample_rate,
+                }
+                await self._websocket.send(json.dumps(message))
+                self._last_audio_time = time.monotonic()
+                logger.trace("Sent keepalive silence to ElevenLabs Realtime STT")
+            except Exception as e:
+                logger.warning(f"{self} keepalive error: {e}")
+                break
 
     async def _connect_websocket(self):
         """Connect to ElevenLabs Realtime STT WebSocket endpoint."""
